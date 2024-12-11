@@ -81,6 +81,27 @@ class GaussianModel:
             self.spatial_lr_scale,
         )
     
+    def capture_attr_with_mask(self, mask):
+        return (
+            self.active_sh_degree,
+            self._xyz[mask],
+            self._features_dc[mask],
+            self._features_rest[mask],
+            self._scaling[mask],
+            self._rotation[mask],
+            self._opacity[mask],
+        )
+    
+    def restore_attr(self, model_args):
+        (self.active_sh_degree, 
+        self._xyz, 
+        self._features_dc, 
+        self._features_rest,
+        self._scaling, 
+        self._rotation, 
+        self._opacity) = model_args
+
+    
     def restore(self, model_args, training_args):
         (self.active_sh_degree, 
         self._xyz, 

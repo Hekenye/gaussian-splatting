@@ -20,6 +20,7 @@ from utils.loss_utils import l1_loss, ssim
 from gaussian_renderer import render, network_gui
 import sys
 from scene import Scene, GaussianModel
+from scene.mixed_gaussian_model import MixedGaussianModel
 from utils.general_utils import safe_state, get_expon_lr_func
 import uuid
 from tqdm import tqdm
@@ -75,10 +76,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     gaussians = GaussianModel(dataset.sh_degree, opt.optimizer_type)
     scene = Scene(dataset, gaussians, shuffle=False)
     gaussians.training_setup(opt)
-    # if checkpoint:
-    #     (model_params, first_iter) = torch.load(checkpoint)
-    #     gaussians.restore(model_params, opt)
-    (model_params, first_iter) = torch.load(args.resume_from)
+    
+    # restore trained gaussians
+    (model_params, _) = torch.load(args.resume_from)
     gaussians.restore(model_params, opt)
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
@@ -95,25 +95,28 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
     # ================ select finetune view (front) ================
     viewpoint_cam = scene.getTrainCameras().copy()[0]
-    print(f"original_image.shape:{viewpoint_cam.original_image.shape}")
-    torchvision.utils.save_image(viewpoint_cam.original_image, "ft_viewpoint_cam.png")
+    print(f"select a special view!")
+    print(f"Selected image is :{viewpoint_cam.image_name}")
+    # torchvision.utils.save_image(viewpoint_cam.original_image, "ft_viewpoint_cam.png")
     
     # ================ tracing gaussians ================
     # render image and segmap
     bg = torch.rand((3), device="cuda") if opt.random_background else background
-    # image = render(viewpoint_cam, gaussians, pipe, bg, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE)["render"]
-    # torchvision.utils.save_image(image, "test.png")
-    # image = cv2.imread("test.png")
-    # image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-    # seg_model = MediapipeSegmenter()
-    # segmap = seg_model._cal_seg_map(image)
-    # head_segmap = (segmap[[1, 3], ...].sum(axis=0) > 0.5).astype(np.uint8) * 255
-    # print(f"segmap.shape:{segmap.shape}, head_segmap.shape:{head_segmap.shape}")
-    # cv2.imwrite("head_segmap.png", head_segmap)
+    image = render(viewpoint_cam, gaussians, pipe, bg, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE)["render"]
+    torchvision.utils.save_image(image, "test.png")
+    image = cv2.imread("test.png")
+    image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    seg_model = MediapipeSegmenter()
+    segmap = seg_model._cal_seg_map(image)
+    head_segmap = (segmap[[1, 3], ...].sum(axis=0) > 0.5).astype(np.uint8) * 255
+    print(f"segmap.shape:{segmap.shape}, head_segmap.shape:{head_segmap.shape}")
+    cv2.imwrite("head_segmap.png", head_segmap)
 
-    # # create labels for non-facial gaussians
-    # head_mask = create_labels_for_OTF(gaussians, viewpoint_cam, segmap)
-    # gaussians.save_ply_with_mask("test/head.ply", head_mask)
+    # create labels for non-facial gaussians
+    head_mask = create_labels_for_OTF(gaussians, viewpoint_cam, segmap)
+    gaussians.save_ply_with_mask("test/head.ply", head_mask)
+    mixed_gaussians = MixedGaussianModel(gaussians, head_mask, opt.optimizer_type)
+    mixed_gaussians.training_setup(opt)
 
     ema_loss_for_log = 0.0
     ema_Ll1depth_for_log = 0.0
@@ -128,7 +131,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 net_image_bytes = None
                 custom_cam, do_training, pipe.convert_SHs_python, pipe.compute_cov3D_python, keep_alive, scaling_modifer = network_gui.receive()
                 if custom_cam != None:
-                    net_image = render(custom_cam, gaussians, pipe, background, scaling_modifier=scaling_modifer, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE)["render"]
+                    net_image = render(custom_cam, mixed_gaussians, pipe, background, scaling_modifier=scaling_modifer, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE)["render"]
                     net_image_bytes = memoryview((torch.clamp(net_image, min=0, max=1.0) * 255).byte().permute(1, 2, 0).contiguous().cpu().numpy())
                 network_gui.send(net_image_bytes, dataset.source_path)
                 if do_training and ((iteration < int(opt.iterations)) or not keep_alive):
@@ -138,25 +141,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         iter_start.record()
 
-        gaussians.update_learning_rate(iteration)
-
-        # Every 1000 its we increase the levels of SH up to a maximum degree
-        if iteration % 1000 == 0:
-            gaussians.oneupSHdegree()
-
-        # # Pick a random Camera
-        # if not viewpoint_stack:
-        #     viewpoint_stack = scene.getTrainCameras().copy()
-        #     viewpoint_indices = list(range(len(viewpoint_stack)))
-        # rand_idx = randint(0, len(viewpoint_indices) - 1)
-        # viewpoint_cam = viewpoint_stack.pop(rand_idx)
-        # vind = viewpoint_indices.pop(rand_idx)
-
         # Render
         if (iteration - 1) == debug_from:
             pipe.debug = True
 
-        render_pkg = render(viewpoint_cam, gaussians, pipe, bg, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE)
+        render_pkg = render(viewpoint_cam, mixed_gaussians, pipe, bg, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE)
         image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
 
         if viewpoint_cam.alpha_mask is not None:
@@ -203,39 +192,25 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 progress_bar.close()
 
             # Log and save
-            training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background, 1., SPARSE_ADAM_AVAILABLE, None, dataset.train_test_exp), dataset.train_test_exp)
+            training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, mixed_gaussians, render, (pipe, background, 1., SPARSE_ADAM_AVAILABLE, None, dataset.train_test_exp), dataset.train_test_exp)
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
-                scene.save(iteration)
-
-            # Densification
-            if iteration < opt.densify_until_iter:
-                # Keep track of max radii in image-space for pruning
-                gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
-                gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
-
-                if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
-                    size_threshold = 20 if iteration > opt.opacity_reset_interval else None
-                    gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold, radii)
-                
-                if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
-                    gaussians.reset_opacity()
+                point_cloud_path = os.path.join(args.model_path, "point_cloud/iteration_{}".format(iteration))
+                mixed_gaussians.save_ply(os.path.join(point_cloud_path, "point_cloud.ply"))
 
             # Optimizer step
             if iteration < opt.iterations:
-                gaussians.exposure_optimizer.step()
-                gaussians.exposure_optimizer.zero_grad(set_to_none = True)
                 if use_sparse_adam:
                     visible = radii > 0
-                    gaussians.optimizer.step(visible, radii.shape[0])
-                    gaussians.optimizer.zero_grad(set_to_none = True)
+                    mixed_gaussians.optimizer.step(visible, radii.shape[0])
+                    mixed_gaussians.optimizer.zero_grad(set_to_none = True)
                 else:
-                    gaussians.optimizer.step()
-                    gaussians.optimizer.zero_grad(set_to_none = True)
+                    mixed_gaussians.optimizer.step()
+                    mixed_gaussians.optimizer.zero_grad(set_to_none = True)
 
-            if (iteration in checkpoint_iterations):
-                print("\n[ITER {}] Saving Checkpoint".format(iteration))
-                torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
+            # if (iteration in checkpoint_iterations):
+            #     print("\n[ITER {}] Saving Checkpoint".format(iteration))
+            #     torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
 
 def prepare_output_and_logger(args):    
     if not args.model_path:
@@ -259,7 +234,7 @@ def prepare_output_and_logger(args):
         print("Tensorboard not available: not logging progress")
     return tb_writer
 
-def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, train_test_exp):
+def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, mixed_gaussians, renderFunc, renderArgs, train_test_exp):
     if tb_writer:
         tb_writer.add_scalar('train_loss_patches/l1_loss', Ll1.item(), iteration)
         tb_writer.add_scalar('train_loss_patches/total_loss', loss.item(), iteration)
@@ -276,7 +251,7 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
                 l1_test = 0.0
                 psnr_test = 0.0
                 for idx, viewpoint in enumerate(config['cameras']):
-                    image = torch.clamp(renderFunc(viewpoint, scene.gaussians, *renderArgs)["render"], 0.0, 1.0)
+                    image = torch.clamp(renderFunc(viewpoint, mixed_gaussians, *renderArgs)["render"], 0.0, 1.0)
                     gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
                     if train_test_exp:
                         image = image[..., image.shape[-1] // 2:]
